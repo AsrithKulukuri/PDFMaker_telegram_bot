@@ -18,6 +18,17 @@ import random
 import os
 import subprocess
 import shutil
+import threading
+
+from flask import Flask
+
+# Flask app to keep Render happy
+flask_app = Flask(__name__)
+
+
+@flask_app.route("/")
+def home():
+    return "🤖 Bot is running!", 200
 
 
 def get_ghostscript_path():
@@ -219,7 +230,7 @@ async def compress_pdf_with_gs(gs_exe, input_path, output_path, quality):
         print(f"Ghostscript failed: {e}")
 
 
-def main():
+def start_telegram_bot():
     TOKEN = os.getenv("BOT_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -259,8 +270,23 @@ def main():
     app.add_handler(conv_handler_convert)
     app.add_handler(conv_handler_compression)
 
-    print("🤖 Bot is running…")
+    print("🤖 Telegram bot is running…")
     app.run_polling()
+
+
+def start_flask():
+    port = int(os.environ.get("PORT", 5000))
+    print(f"🌐 Flask server running on port {port}")
+    flask_app.run(host="0.0.0.0", port=port)
+
+
+def main():
+    # Run Flask in background thread
+    flask_thread = threading.Thread(target=start_flask)
+    flask_thread.start()
+
+    # Run Telegram bot on main thread
+    start_telegram_bot()
 
 
 if __name__ == "__main__":
