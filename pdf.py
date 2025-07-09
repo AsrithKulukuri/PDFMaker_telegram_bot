@@ -18,30 +18,19 @@ import random
 import os
 import subprocess
 import shutil
-import threading
+from pathlib import Path
 
-from flask import Flask
-
-# Flask app to keep Render happy
-flask_app = Flask(__name__)
-
-
-@flask_app.route("/")
-def home():
-    return "🤖 Bot is running!", 200
+CHOOSING, CHOOSING_LEVEL, RECEIVING_FILE = range(3)
 
 
 def get_ghostscript_path():
     return shutil.which("gs")
 
 
-IMAGE_LIST = []
-COMPRESSION_MODE = None
-
-CHOOSING, CHOOSING_LEVEL, RECEIVING_FILE = range(3)
-
 # GHOSTSCRIPT_PATH = r"C:\Program Files\gs\gs10.05.1\bin\gswin64c.exe"
 GHOSTSCRIPT_PATH = get_ghostscript_path()
+TEMP_DIR = Path("temp")
+TEMP_DIR.mkdir(exist_ok=True)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -53,10 +42,30 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                               callback_data="compression")],
     ]
     await update.message.reply_text(
-        f"👋 Welcome, *{name}*! What would you like to do?",
+        f"👋 Welcome, *{name}*! What would you like to do?\n\n"
+        "You can also send /cancel anytime to stop.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cleanup_user_temp(update.effective_user.id)
+    context.user_data.clear()
+    await update.message.reply_text("🚫 Operation cancelled. Send /start to begin again.")
+    return ConversationHandler.END
+
+
+def cleanup_user_temp(user_id: int):
+    user_dir = TEMP_DIR / str(user_id)
+    if user_dir.exists():
+        shutil.rmtree(user_dir)
+
+
+def get_user_temp(user_id: int):
+    user_dir = TEMP_DIR / str(user_id)
+    user_dir.mkdir(exist_ok=True)
+    return user_dir
 
 
 async def start_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -64,10 +73,9 @@ async def start_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
 
     if query.data == "convert":
-        IMAGE_LIST.clear()
+        context.user_data["image_list"] = []
         await query.edit_message_text(
-            "📷 Please send me *all the images you want in the PDF*. Send `/done` when finished.",
-            parse_mode="Markdown"
+            "📷 Please send me all the images you want in the PDF."
         )
         return RECEIVING_FILE
 
@@ -87,44 +95,58 @@ async def start_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def receive_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_dir = get_user_temp(update.effective_user.id)
+    image_list = context.user_data.setdefault("image_list", [])
     photo = update.message.photo[-1]
     file = await photo.get_file()
-    file_path = f"temp_{len(IMAGE_LIST)}.jpg"
-    await file.download_to_drive(file_path)
-    IMAGE_LIST.append(file_path)
-    await update.message.reply_text("✅ Image saved! Send more or `/done`.")
+    file_path = user_dir / f"{len(image_list) + 1}.jpg"
+    await file.download_to_drive(str(file_path))
+    image_list.append(str(file_path))
+
+    if len(image_list) == 1:
+        await update.message.reply_text(
+            f"✅ Image saved (1)! 📝 When ready, type `/done`."
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Image saved ({len(image_list)})!"
+        )
 
 
 async def done(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not IMAGE_LIST:
-        await update.message.reply_text("⚠️ No images received.")
+    image_list = context.user_data.get("image_list", [])
+    if not image_list:
+        await update.message.reply_text("⚠️ No images received. Send /start to try again.")
         return ConversationHandler.END
 
-    username = update.effective_user.username or "user"
-    rand_num = random.randint(10, 99)
+    username = update.effective_user.username or f"user{update.effective_user.id}"
+    rand_num = random.randint(100, 999)
     pdf_filename = f"{username}-{rand_num}.pdf"
 
-    with open(pdf_filename, "wb") as f:
-        f.write(img2pdf.convert(IMAGE_LIST))
+    try:
+        with open(pdf_filename, "wb") as f:
+            f.write(img2pdf.convert(image_list))
 
-    for img in IMAGE_LIST:
-        os.remove(img)
-    IMAGE_LIST.clear()
+        await update.message.reply_document(open(pdf_filename, "rb"), caption="📄 Here is your PDF!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to create PDF: {e}")
+    finally:
+        cleanup_user_temp(update.effective_user.id)
+        if os.path.exists(pdf_filename):
+            os.remove(pdf_filename)
+        context.user_data.clear()
 
-    await update.message.reply_document(open(pdf_filename, "rb"), caption="📄 Here is your PDF!")
-    os.remove(pdf_filename)
     return ConversationHandler.END
 
 
 async def compression_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global COMPRESSION_MODE
     query = update.callback_query
     await query.answer()
 
     if query.data == "compression_image":
-        COMPRESSION_MODE = "Image"
+        context.user_data["compression_mode"] = "Image"
     elif query.data == "compression_pdf":
-        COMPRESSION_MODE = "PDF"
+        context.user_data["compression_mode"] = "PDF"
 
     keyboard = [
         [
@@ -134,7 +156,7 @@ async def compression_type_handler(update: Update, context: ContextTypes.DEFAULT
         ]
     ]
     await query.edit_message_text(
-        f"🔧 Selected: *{COMPRESSION_MODE} compression*.\nNow choose compression level:",
+        f"🔧 Selected: *{context.user_data['compression_mode']} compression*.\nNow choose compression level:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
@@ -157,51 +179,60 @@ async def compression_level_handler(update: Update, context: ContextTypes.DEFAUL
 
 
 async def handle_compression(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.document:  # file sent as document
+    user_dir = get_user_temp(update.effective_user.id)
+    compression_mode = context.user_data.get("compression_mode", "Image")
+
+    if update.message.document:
         file = await update.message.document.get_file()
         file_name = update.message.document.file_name
-    elif update.message.photo:  # file sent as photo
+    elif update.message.photo:
         photo = update.message.photo[-1]
         file = await photo.get_file()
         file_name = f"photo_{random.randint(1000, 9999)}.jpg"
     else:
-        await update.message.reply_text("⚠️ Please send a file or photo.")
+        await update.message.reply_text("⚠️ Please send a valid file or photo.")
         return RECEIVING_FILE
 
-    file_path = f"received_{file_name}"
-    await file.download_to_drive(file_path)
+    file_path = user_dir / file_name
+    await file.download_to_drive(str(file_path))
 
-    if COMPRESSION_MODE == "Image":
-        output_path = f"compressed_{os.path.splitext(file_name)[0]}.jpg"
-        img = Image.open(file_path)
-        img = img.convert("RGB")  # ensures it can save as JPEG
-        img.save(
-            output_path,
-            format="JPEG",
-            quality=context.user_data["compression_quality"],
-            optimize=True,
-            progressive=True
-        )
+    output_path = user_dir / f"compressed_{file_name}"
 
-        await update.message.reply_document(open(output_path, "rb"), caption="✅ Here is your compressed image.")
-
-    elif COMPRESSION_MODE == "PDF":
-        output_path = f"compressed_{file_name}"
-
-        if not os.path.exists(GHOSTSCRIPT_PATH):
-            await update.message.reply_text(
-                "⚠️ Ghostscript not found at the specified path.\n"
-                "Please check the path and try again."
+    try:
+        if compression_mode == "Image":
+            img = Image.open(file_path)
+            img = img.convert("RGB")
+            img.save(
+                output_path,
+                format="JPEG",
+                quality=context.user_data["compression_quality"],
+                optimize=True,
+                progressive=True
             )
-            os.remove(file_path)
-            return ConversationHandler.END
+            await update.message.reply_document(open(output_path, "rb"), caption="✅ Here is your compressed image.")
 
-        await compress_pdf_with_gs(GHOSTSCRIPT_PATH, file_path, output_path, context.user_data["compression_quality"])
+        elif compression_mode == "PDF":
+            if not os.path.exists(GHOSTSCRIPT_PATH):
+                await update.message.reply_text(
+                    "⚠️ Ghostscript not found at the specified path.\nPlease check the path and try again."
+                )
+                return ConversationHandler.END
 
-        await update.message.reply_document(open(output_path, "rb"), caption="✅ Here is your compressed PDF.")
+            await compress_pdf_with_gs(
+                GHOSTSCRIPT_PATH,
+                str(file_path),
+                str(output_path),
+                context.user_data["compression_quality"]
+            )
+            await update.message.reply_document(open(output_path, "rb"), caption="✅ Here is your compressed PDF.")
 
-    os.remove(file_path)
-    os.remove(output_path)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to compress: {e}")
+
+    finally:
+        cleanup_user_temp(update.effective_user.id)
+        context.user_data.clear()
+
     return ConversationHandler.END
 
 
@@ -224,13 +255,10 @@ async def compress_pdf_with_gs(gs_exe, input_path, output_path, quality):
         f"-sOutputFile={output_path}",
         input_path,
     ]
-    try:
-        subprocess.run(cmd, check=True)
-    except subprocess.CalledProcessError as e:
-        print(f"Ghostscript failed: {e}")
+    subprocess.run(cmd, check=True)
 
 
-def start_telegram_bot():
+def main():
     TOKEN = os.getenv("BOT_TOKEN")
     app = ApplicationBuilder().token(TOKEN).build()
 
@@ -241,9 +269,12 @@ def start_telegram_bot():
             RECEIVING_FILE: [
                 MessageHandler(filters.PHOTO, receive_image),
                 CommandHandler("done", done),
+                CommandHandler("cancel", cancel),
             ],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
+        per_chat=True
     )
 
     conv_handler_compression = ConversationHandler(
@@ -261,32 +292,21 @@ def start_telegram_bot():
             RECEIVING_FILE: [
                 MessageHandler(filters.Document.ALL |
                                filters.PHOTO, handle_compression),
+                CommandHandler("cancel", cancel),
             ],
         },
-        fallbacks=[],
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
+        per_chat=True
     )
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(conv_handler_convert)
     app.add_handler(conv_handler_compression)
 
-    print("🤖 Telegram bot is running…")
+    print("🤖 Bot is running…")
     app.run_polling()
-
-
-def start_flask():
-    port = int(os.environ.get("PORT", 5000))
-    print(f"🌐 Flask server running on port {port}")
-    flask_app.run(host="0.0.0.0", port=port)
-
-
-def main():
-    # Run Flask in background thread
-    flask_thread = threading.Thread(target=start_flask)
-    flask_thread.start()
-
-    # Run Telegram bot on main thread
-    start_telegram_bot()
 
 
 if __name__ == "__main__":
